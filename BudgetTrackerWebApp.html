@@ -190,6 +190,10 @@
   /* Receipt OCR styles */
   .receipt-preview { background: var(--surface2); border-radius: 10px; padding: 12px; font-size: 12px; color: var(--text2); max-height: 140px; overflow-y: auto; white-space: pre-wrap; font-family: monospace; margin-top: 8px; }
   .ocr-loading { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--accent); padding: 10px 0; }
+  .ocr-spinner { width: 14px; height: 14px; border-radius: 50%; border: 2px solid rgba(108,99,255,.25); border-top-color: var(--accent); animation: ocrSpin .7s linear infinite; }
+  @keyframes ocrSpin { to { transform: rotate(360deg); } }
+  .ocr-result-summary { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: var(--text2); background: var(--surface2); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+  .ocr-result-summary b { color: var(--text); }
   .receipt-collapsible { margin-top: 8px; }
   .receipt-toggle { background: none; border: none; color: var(--accent); font-size: 12px; cursor: pointer; padding: 0; }
   @media (max-width: 768px) {
@@ -302,9 +306,9 @@
         <input type="text" id="search-input" placeholder="🔍 Search transactions..." oninput="renderTransactions()" style="flex:1;min-width:180px;">
         <select id="filter-type" onchange="renderTransactions()">
           <option value="" data-i18n="all_types">All Types</option>
-          <option data-i18n="type_income">Income</option>
-          <option data-i18n="type_expense">Expense</option>
-          <option data-i18n="type_transfer">Transfer</option>
+          <option value="Income" data-i18n="type_income">Income</option>
+          <option value="Expense" data-i18n="type_expense">Expense</option>
+          <option value="Transfer" data-i18n="type_transfer">Transfer</option>
         </select>
         <select id="filter-cat" onchange="renderTransactions()"><option value="" data-i18n="all_categories">All Categories</option></select>
         <select id="filter-month" onchange="renderTransactions()"><option value="" data-i18n="all_months">All Months</option></select>
@@ -482,8 +486,13 @@
     <!-- Receipt Scan Button -->
     <div class="form-group">
       <button class="btn btn-ghost" onclick="triggerReceiptScan()" id="scan-receipt-btn">📷 <span data-i18n="scan_receipt">Scan Receipt</span></button>
-      <input type="file" id="receipt-file-input" accept="image/*" style="display:none;" onchange="handleReceiptFile(this)">
-      <div id="ocr-loading" class="ocr-loading" style="display:none;">🔍 <span data-i18n="scanning">Scanning receipt...</span></div>
+      <input type="file" id="receipt-file-input" accept="image/*" capture="environment" style="display:none;" onchange="handleReceiptFile(this)">
+      <div id="ocr-loading" class="ocr-loading" style="display:none;">
+        <div class="ocr-spinner"></div>
+        <span id="ocr-loading-text">🔍 <span data-i18n="scanning">Scanning receipt...</span></span>
+      </div>
+      <img id="receipt-thumb" style="display:none;max-width:100%;max-height:160px;border-radius:10px;margin-top:8px;border:1px solid var(--border);object-fit:contain;">
+      <div id="ocr-result-summary" class="ocr-result-summary" style="display:none;"></div>
       <div class="receipt-collapsible" id="receipt-collapsible" style="display:none;">
         <button class="receipt-toggle" onclick="toggleReceiptPreview()">▼ <span data-i18n="show_extracted_text">Show extracted text</span></button>
         <div class="receipt-preview" id="receipt-preview" style="display:none;"></div>
@@ -647,7 +656,7 @@
       </div>
       <div class="form-group">
         <label data-i18n="type_label">Type</label>
-        <select id="rec-type"><option data-i18n="type_expense">Expense</option><option data-i18n="type_income">Income</option></select>
+        <select id="rec-type"><option value="Expense" data-i18n="type_expense">Expense</option><option value="Income" data-i18n="type_income">Income</option></select>
       </div>
     </div>
     <div class="form-row">
@@ -712,6 +721,7 @@ const LANG = {
     manage_categories: 'Manage Categories', add_category: '＋ Add',
     scan_receipt: 'Scan Receipt', scanning: 'Scanning receipt...', show_extracted_text: 'Show extracted text',
     hide_extracted_text: 'Hide extracted text', ocr_done: 'Receipt scanned & form pre-filled!',
+    ocr_amount_not_found: 'Amount not detected, please check', ocr_date_fallback: "today's date used",
     type_label: 'Type', amount_label: 'Amount', date_label: 'Date',
     description_label: 'Description', notes_label: 'Notes (optional)',
     cancel: 'Cancel', save_transaction: 'Save Transaction', save_budget: 'Save Budget',
@@ -759,6 +769,7 @@ const LANG = {
     manage_categories: 'Kelola Kategori', add_category: '＋ Tambah',
     scan_receipt: 'Pindai Struk', scanning: 'Memindai struk...', show_extracted_text: 'Tampilkan teks hasil',
     hide_extracted_text: 'Sembunyikan teks hasil', ocr_done: 'Struk dipindai & formulir terisi otomatis!',
+    ocr_amount_not_found: 'Nominal tidak terdeteksi, mohon periksa', ocr_date_fallback: 'tanggal hari ini digunakan',
     type_label: 'Jenis', amount_label: 'Jumlah', date_label: 'Tanggal',
     description_label: 'Deskripsi', notes_label: 'Catatan (opsional)',
     cancel: 'Batal', save_transaction: 'Simpan Transaksi', save_budget: 'Simpan Anggaran',
@@ -902,10 +913,13 @@ let charts = {};
 let currentCatTab = 'expense';
 
 function uid() { return '_' + Math.random().toString(36).substr(2, 9); }
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function currencySymbol() { return state.profile.currency || '$'; }
+const ZERO_DECIMAL_CURRENCIES = ['Rp', '¥'];
 function fmt$(n) {
   const sym = currencySymbol();
-  return sym + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  const decimals = ZERO_DECIMAL_CURRENCIES.includes(sym) ? 0 : 2;
+  return sym + Math.abs(n).toLocaleString('en-US', {minimumFractionDigits:decimals, maximumFractionDigits:decimals});
 }
 function fmtDate(s) { if (!s) return ''; const d = new Date(s + 'T00:00:00'); return d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }
 function catColor(cat) {
@@ -947,11 +961,11 @@ function navigate(page) {
 }
 function toggleSidebar() { document.getElementById('sidebar').classList.toggle('open'); }
 function toggleTheme() {
-  const t = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
-  document.body.dataset.theme = t;
-  state.theme = t;
-  document.getElementById('theme-icon').textContent = t === 'dark' ? '☀️' : '🌙';
-  document.getElementById('theme-text').textContent = t(t === 'dark' ? 'light_mode' : 'dark_mode');
+  const newTheme = document.body.dataset.theme === 'dark' ? 'light' : 'dark';
+  document.body.dataset.theme = newTheme;
+  state.theme = newTheme;
+  document.getElementById('theme-icon').textContent = newTheme === 'dark' ? '☀️' : '🌙';
+  document.getElementById('theme-text').textContent = t(newTheme === 'dark' ? 'light_mode' : 'dark_mode');
   Object.values(charts).forEach(c => { try { c.destroy(); } catch{} });
   charts = {};
   renderDashboard();
@@ -983,6 +997,8 @@ function openModal(mode, id) {
   document.getElementById('ocr-loading').style.display = 'none';
   document.getElementById('receipt-collapsible').style.display = 'none';
   document.getElementById('receipt-preview').style.display = 'none';
+  document.getElementById('receipt-thumb').style.display = 'none';
+  document.getElementById('ocr-result-summary').style.display = 'none';
   document.getElementById('receipt-file-input').value = '';
 
   if (mode === 'edit' && id) {
@@ -1179,7 +1195,7 @@ function renderTopCategories() {
     const pct = total > 0 ? Math.round(amt/total*100) : 0;
     return `<div style="margin-bottom:14px;">
       <div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:5px;">
-        <span>${catIcon(cat)} ${cat}</span><span class="fw-700">${fmt$(amt)}</span>
+        <span>${catIcon(cat)} ${esc(cat)}</span><span class="fw-700">${fmt$(amt)}</span>
       </div>
       <div class="progress-bar"><div class="progress-fill progress-ok" style="width:${pct}%;background:${catColor(cat)};"></div></div>
     </div>`;
@@ -1193,8 +1209,8 @@ function renderRecentTransactions() {
   tbody.innerHTML = txns.map(tx => `
     <tr>
       <td>${fmtDate(tx.date)}</td>
-      <td>${tx.desc}</td>
-      <td><span class="cat-badge">${catIcon(tx.cat)} ${tx.cat}</span></td>
+      <td>${esc(tx.desc)}</td>
+      <td><span class="cat-badge">${catIcon(tx.cat)} ${esc(tx.cat)}</span></td>
       <td><span class="badge badge-${tx.type.toLowerCase()}">${tx.type}</span></td>
       <td class="${tx.type==='Income'?'text-green':'text-red'} fw-700">${tx.type==='Income'?'+':'-'}${fmt$(tx.amount)}</td>
     </tr>`).join('');
@@ -1214,7 +1230,7 @@ function renderTransactions() {
   const cats = [...new Set(state.transactions.map(tx => tx.cat))].sort();
   const catSel = document.getElementById('filter-cat');
   const prevCat = catSel.value;
-  catSel.innerHTML = `<option value="">${t('all_categories')}</option>` + cats.map(c => `<option ${c===prevCat?'selected':''}>${c}</option>`).join('');
+  catSel.innerHTML = `<option value="">${t('all_categories')}</option>` + cats.map(c => `<option value="${esc(c)}" ${c===prevCat?'selected':''}>${esc(c)}</option>`).join('');
 
   const months = [...new Set(state.transactions.map(tx => tx.date.substring(0,7)))].sort().reverse();
   const moSel = document.getElementById('filter-month');
@@ -1242,9 +1258,9 @@ function renderTransactions() {
     tbody.innerHTML = slice.map(tx => `
       <tr>
         <td>${fmtDate(tx.date)}</td>
-        <td>${tx.desc}${tx.notes?'<br><span style="font-size:11px;color:var(--text3);">'+tx.notes+'</span>':''}</td>
-        <td><span class="cat-badge">${catIcon(tx.cat)} ${tx.cat}</span></td>
-        <td>${tx.account}</td>
+        <td>${esc(tx.desc)}${tx.notes?'<br><span style="font-size:11px;color:var(--text3);">'+esc(tx.notes)+'</span>':''}</td>
+        <td><span class="cat-badge">${catIcon(tx.cat)} ${esc(tx.cat)}</span></td>
+        <td>${esc(tx.account)}</td>
         <td><span class="badge badge-${tx.type.toLowerCase()}">${tx.type}</span></td>
         <td class="${tx.type==='Income'?'text-green':tx.type==='Expense'?'text-red':'text-accent'} fw-700">
           ${tx.type==='Income'?'+':tx.type==='Expense'?'-':''}${fmt$(tx.amount)}
@@ -1437,7 +1453,7 @@ function renderGoals() {
     return `<div class="card goal-card">
       <div style="display:flex;justify-content:space-between;align-items:flex-start;">
         <div>
-          <div class="goal-name">${g.icon || '🎯'} ${g.name}</div>
+          <div class="goal-name">${g.icon || '🎯'} ${esc(g.name)}</div>
           <div class="goal-target">Target: ${fmt$(g.target)}</div>
         </div>
         <div class="flex gap-2">
@@ -1509,7 +1525,8 @@ function renderNetWorth() {
   const assets = accounts.filter(a => !liabilityTypes.includes(a.type));
   const liabilities = accounts.filter(a => liabilityTypes.includes(a.type));
   const totalAssets = assets.reduce((s,a) => s + Math.max(0, a.balance), 0);
-  const totalLiabilities = liabilities.reduce((s,a) => s + Math.abs(a.balance), 0);
+  const totalLiabilities = liabilities.reduce((s,a) => s + Math.abs(a.balance), 0)
+    + assets.reduce((s,a) => s + Math.max(0, -a.balance), 0);
   const netWorth = accounts.reduce((s,a) => s + a.balance, 0);
 
   document.getElementById('nw-summary').innerHTML = `
@@ -1521,7 +1538,7 @@ function renderNetWorth() {
     if (!arr.length) { document.getElementById(el).innerHTML = '<p style="color:var(--text3);font-size:13px;">No accounts</p>'; return; }
     document.getElementById(el).innerHTML = arr.map(a => `
       <div class="account-item">
-        <div><div class="account-name">${a.name}</div><div class="account-type">${a.type}</div></div>
+        <div><div class="account-name">${esc(a.name)}</div><div class="account-type">${esc(a.type)}</div></div>
         <div style="display:flex;align-items:center;gap:8px;">
           <span class="account-balance ${a.balance>=0?'positive':'negative'}">${a.balance>=0?'':'-'}${fmt$(Math.abs(a.balance))}</span>
           <button class="btn btn-ghost btn-sm" onclick="openAccountModal('${a.id}')">✏️</button>
@@ -1534,14 +1551,29 @@ function renderNetWorth() {
   renderNetWorthChart();
 }
 function renderNetWorthChart() {
-  const labels = [], data = [];
-  for (let i = 5; i >= 0; i--) {
-    const d = new Date(); d.setMonth(d.getMonth() - i);
-    labels.push(d.toLocaleDateString('en-US',{month:'short',year:'2-digit'}));
-    const net = state.accounts.reduce((s,a) => s + a.balance, 0);
-    data.push(Math.round(net * (0.85 + Math.random() * 0.15)));
+  // Walk backward from today's real net worth, undoing each month's net cash flow
+  // (income - expense) from actual transactions to derive prior month-end balances.
+  const currentNet = state.accounts.reduce((s,a) => s + a.balance, 0);
+  const txns = state.transactions;
+  const months = [];
+  for (let i = 0; i <= 5; i++) {
+    const d = new Date(); d.setDate(1); d.setMonth(d.getMonth() - i);
+    months.push(d);
   }
-  data[data.length-1] = Math.round(state.accounts.reduce((s,a) => s + a.balance, 0));
+  const netFlowForMonth = (d) => {
+    const key = d.toISOString().slice(0,7);
+    return txns.filter(tx => tx.date.startsWith(key) && tx.type !== 'Transfer')
+      .reduce((s,tx) => s + (tx.type === 'Income' ? tx.amount : -tx.amount), 0);
+  };
+  let running = currentNet;
+  const values = [Math.round(running)]; // index 0 = this month (today)
+  for (let i = 0; i < 5; i++) {
+    running -= netFlowForMonth(months[i]);
+    values.push(Math.round(running));
+  }
+  values.reverse();
+  const labels = months.slice().reverse().map(d => d.toLocaleDateString('en-US',{month:'short',year:'2-digit'}));
+  const data = values;
   const ctx = document.getElementById('networthChart').getContext('2d');
   if (charts.networth) charts.networth.destroy();
   charts.networth = new Chart(ctx, {
@@ -1603,8 +1635,8 @@ function renderRecurring() {
     <div class="recurring-item">
       <div class="rec-icon" style="background:rgba(108,99,255,.15)">${catIcon(r.cat)}</div>
       <div class="rec-details">
-        <div class="rec-name">${r.name}</div>
-        <div class="rec-freq">${r.freq.charAt(0).toUpperCase()+r.freq.slice(1)} · ${r.cat}</div>
+        <div class="rec-name">${esc(r.name)}</div>
+        <div class="rec-freq">${r.freq.charAt(0).toUpperCase()+r.freq.slice(1)} · ${esc(r.cat)}</div>
       </div>
       <div>
         <div class="rec-amount ${r.type==='Income'?'text-green':'text-red'}">${r.type==='Income'?'+':'-'}${fmt$(r.amount)}</div>
@@ -1627,7 +1659,7 @@ function renderRecurring() {
     <div class="recurring-item">
       <div class="rec-icon" style="background:rgba(255,215,64,.1)">${catIcon(r.cat)}</div>
       <div class="rec-details">
-        <div class="rec-name">${r.name}</div>
+        <div class="rec-name">${esc(r.name)}</div>
         <div class="rec-freq">${fmtDate(r.nextDate)}</div>
       </div>
       <div class="rec-amount ${r.type==='Income'?'text-green':'text-red'}">${r.type==='Income'?'+':'-'}${fmt$(r.amount)}</div>
@@ -1822,7 +1854,7 @@ function renderCatManager() {
   el.innerHTML = list.map((cat, i) => `
     <div class="cat-item" id="cat-item-${currentCatTab}-${i}">
       <div class="cat-item-icon">${catIcon(cat)}</div>
-      <div class="cat-item-name" id="cat-name-${currentCatTab}-${i}">${cat}</div>
+      <div class="cat-item-name" id="cat-name-${currentCatTab}-${i}">${esc(cat)}</div>
       <button class="btn btn-ghost btn-sm" onclick="startRenameCategory('${currentCatTab}',${i})" title="Rename">✏️</button>
       <button class="btn btn-danger btn-sm" onclick="deleteCategory('${currentCatTab}',${i})" title="Delete">🗑️</button>
     </div>`).join('');
@@ -1831,7 +1863,7 @@ function renderCatManager() {
 function startRenameCategory(type, index) {
   const nameEl = document.getElementById(`cat-name-${type}-${index}`);
   const currentName = state.categories[type][index];
-  nameEl.innerHTML = `<input type="text" value="${currentName}" id="cat-rename-input" style="flex:1;" onkeydown="if(event.key==='Enter')finishRename('${type}',${index})">
+  nameEl.innerHTML = `<input type="text" value="${esc(currentName)}" id="cat-rename-input" style="flex:1;" onkeydown="if(event.key==='Enter')finishRename('${type}',${index})">
     <button class="btn btn-primary btn-sm" onclick="finishRename('${type}',${index})">✓</button>`;
   document.getElementById('cat-rename-input').focus();
 }
@@ -1860,7 +1892,12 @@ function deleteCategory(type, index) {
   const catName = cats[type][index];
   if (!confirm(`Delete category "${catName}"?`)) return;
   cats[type].splice(index, 1);
+  const fallback = cats[type][0] || (type === 'income' ? 'Other Income' : 'Other');
   state.categories = cats;
+  // Reassign any transactions/budgets/recurring items still pointing at the deleted category
+  state.transactions = state.transactions.map(tx => tx.cat === catName ? { ...tx, cat: fallback } : tx);
+  state.budgets = state.budgets.filter(b => b.cat !== catName);
+  state.recurring = state.recurring.map(r => r.cat === catName ? { ...r, cat: fallback } : r);
   toast('Category deleted');
   renderCatManager();
 }
@@ -1890,11 +1927,27 @@ function triggerReceiptScan() {
 function handleReceiptFile(input) {
   const file = input.files[0];
   if (!file) return;
+  if (!file.type.startsWith('image/')) { toast('Please select an image file', 'error'); return; }
+
+  // Show a preview of the picked image immediately
+  const thumb = document.getElementById('receipt-thumb');
+  const reader = new FileReader();
+  reader.onload = e => { thumb.src = e.target.result; thumb.style.display = 'block'; };
+  reader.readAsDataURL(file);
+
   document.getElementById('ocr-loading').style.display = 'flex';
+  document.getElementById('ocr-loading-text').innerHTML = '🔍 <span>' + t('scanning') + '</span>';
   document.getElementById('receipt-collapsible').style.display = 'none';
+  document.getElementById('ocr-result-summary').style.display = 'none';
   document.getElementById('scan-receipt-btn').disabled = true;
 
-  Tesseract.recognize(file, 'eng')
+  Tesseract.recognize(file, 'eng+ind', {
+    logger: m => {
+      if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+        document.getElementById('ocr-loading-text').innerHTML = '🔍 <span>' + t('scanning') + ' ' + Math.round(m.progress * 100) + '%</span>';
+      }
+    }
+  })
     .then(({ data: { text } }) => {
       document.getElementById('ocr-loading').style.display = 'none';
       document.getElementById('scan-receipt-btn').disabled = false;
@@ -1918,51 +1971,119 @@ function toggleReceiptPreview() {
   btn.innerHTML = (visible ? '▼ ' : '▲ ') + t(visible ? 'show_extracted_text' : 'hide_extracted_text');
 }
 
+// Parse a numeric token from a receipt, correctly handling both Western
+// (1,234.56) and Indonesian/European (1.234,56 or 1.234) formatting.
+function parseReceiptNumber(raw) {
+  let s = raw.trim().replace(/[^\d.,]/g, '');
+  if (!s) return NaN;
+  const lastComma = s.lastIndexOf(',');
+  const lastDot = s.lastIndexOf('.');
+  if (lastComma > -1 && lastDot > -1) {
+    // Whichever separator appears last is the decimal separator
+    if (lastComma > lastDot) s = s.replace(/\./g, '').replace(',', '.');
+    else s = s.replace(/,/g, '');
+  } else if (lastComma > -1) {
+    // Only commas: decimal if exactly 2 digits follow the last one, else thousands
+    const parts = s.split(',');
+    s = (parts.length === 2 && parts[1].length === 2) ? parts.join('.') : parts.join('');
+  } else if (lastDot > -1) {
+    // Only dots: decimal if exactly 2 digits follow the last one, else thousands (Indonesian style)
+    const parts = s.split('.');
+    const decimals = parts[parts.length - 1].length;
+    s = decimals === 2 ? parts.slice(0, -1).join('') + '.' + parts[parts.length - 1] : parts.join('');
+  }
+  const val = parseFloat(s);
+  return isNaN(val) ? NaN : val;
+}
+
+// Extract a date (day/month/year in any common order) from receipt text and
+// return it as YYYY-MM-DD, or null if nothing plausible was found.
+function parseReceiptDate(text) {
+  const monthNames = { jan:1,feb:2,mar:3,apr:4,mei:5,may:5,jun:6,jul:7,agu:8,aug:8,sep:9,okt:10,oct:10,nov:11,des:12,dec:12 };
+  const now = new Date();
+  const clamp = (y) => (y < 100 ? 2000 + y : y);
+  const isPlausible = (y,m,d) => y >= 2000 && y <= now.getFullYear() + 1 && m >= 1 && m <= 12 && d >= 1 && d <= 31;
+
+  // "23 Jul 2026" / "23 Juli 2026"
+  let m = text.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{2,4})\b/);
+  if (m) {
+    const mon = monthNames[m[2].slice(0,3).toLowerCase()];
+    const y = clamp(parseInt(m[3]));
+    const d = parseInt(m[1]);
+    if (mon && isPlausible(y, mon, d)) return `${y}-${String(mon).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  // YYYY-MM-DD or YYYY/MM/DD
+  m = text.match(/\b(20\d{2})[\/\-.](\d{1,2})[\/\-.](\d{1,2})\b/);
+  if (m) {
+    const y = parseInt(m[1]), mo = parseInt(m[2]), d = parseInt(m[3]);
+    if (isPlausible(y, mo, d)) return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  // DD/MM/YYYY or DD-MM-YYYY (day-first, common in Indonesia)
+  m = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/);
+  if (m) {
+    const a = parseInt(m[1]), b = parseInt(m[2]), y = clamp(parseInt(m[3]));
+    // Prefer day-first interpretation; fall back to month-first if day-first is invalid
+    if (isPlausible(y, b, a)) return `${y}-${String(b).padStart(2,'0')}-${String(a).padStart(2,'0')}`;
+    if (isPlausible(y, a, b)) return `${y}-${String(a).padStart(2,'0')}-${String(b).padStart(2,'0')}`;
+  }
+  return null;
+}
+
 function parseAndFillReceipt(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  const fullText = text.toLowerCase();
 
-  // 1. Find amount – look for Total / Grand Total / Amount patterns
+  // 1. Find amount – look for Total / Grand Total / Bayar / Jumlah patterns (EN + ID),
+  //    preferring the largest matching "total"-style line since receipts often list
+  //    subtotal, tax, and grand total separately.
   let amount = null;
-  const amountPatterns = [
-    /(?:grand\s+total|total\s+amount|total|amount\s+due|subtotal|balance\s+due)[^\d]*([\d,]+\.?\d*)/i,
-    /([\d,]+\.\d{2})\s*$/i,
-  ];
+  const totalLinePattern = /(?:grand\s*total|total\s*(?:amount|belanja|bayar|tagihan)?|jumlah\s*(?:bayar|total)?|amount\s*due|balance\s*due|bayar|tunai|cash)[^\d]{0,10}(rp\.?\s*)?([\d][\d.,]*\d|\d)/i;
+  const candidates = [];
   for (const line of lines) {
-    for (const pat of amountPatterns) {
-      const m = line.match(pat);
-      if (m) {
-        const val = parseFloat(m[1].replace(/,/g, ''));
-        if (!isNaN(val) && val > 0) { amount = val; break; }
-      }
+    const m = line.match(totalLinePattern);
+    if (m) {
+      const val = parseReceiptNumber(m[2]);
+      if (!isNaN(val) && val > 0) candidates.push(val);
     }
-    if (amount) break;
+  }
+  if (candidates.length) {
+    amount = Math.max(...candidates);
+  } else {
+    // Fallback: largest plausible currency-like number anywhere in the receipt
+    const numMatches = [...text.matchAll(/\d[\d.,]{2,}\d/g)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
+    if (numMatches.length) amount = Math.max(...numMatches);
   }
 
-  // 2. Infer description from first meaningful non-number line
+  // 2. Infer merchant/description from the first meaningful, mostly-alphabetic line
   let desc = '';
   for (const line of lines) {
-    if (line.length > 2 && !/^[\d\s\.,\-\*#=]+$/.test(line) && !/receipt|invoice|bill|thank you/i.test(line)) {
+    if (line.length > 2 && /[a-zA-Z]{3,}/.test(line) &&
+        !/^[\d\s.,\-*#=]+$/.test(line) &&
+        !/receipt|invoice|bill|thank you|struk|terima kasih|npwp|no\.?\s*telp/i.test(line)) {
       desc = line.substring(0, 60);
       break;
     }
   }
 
-  // 3. Auto-detect category based on keywords
-  const fullText = text.toLowerCase();
+  // 3. Extract transaction date from the receipt text (fallback: today)
+  const foundDate = parseReceiptDate(text);
+  const date = foundDate || new Date().toISOString().split('T')[0];
+
+  // 4. Auto-detect category based on keywords (English + Indonesian)
   let cat = 'Other';
   const kwMap = [
-    { keys: ['restaurant','cafe','coffee','food','pizza','burger','diner','bistro','kfc','mcdonald','starbucks','bakery','sushi','noodle'], cat: 'Food & Dining' },
-    { keys: ['pharmacy','drug','clinic','hospital','health','medical','medicine','vitamin','dental'], cat: 'Health & Fitness' },
-    { keys: ['grocery','mart','supermarket','hypermarket','carrefour','walmart','indomaret','alfamart','whole foods'], cat: 'Food & Dining' },
-    { keys: ['gas','fuel','petrol','shell','bp ','chevron','esso'], cat: 'Transportation' },
-    { keys: ['uber','lyft','grab','gojek','taxi','bus','train','metro','toll'], cat: 'Transportation' },
-    { keys: ['amazon','shopee','tokopedia','lazada','ebay','shop','mall','store'], cat: 'Shopping' },
-    { keys: ['netflix','spotify','cinema','movie','theatre','game','entertainment'], cat: 'Entertainment' },
-    { keys: ['electric','water','internet','phone','telco','pln','wifi'], cat: 'Utilities' },
-    { keys: ['hotel','airbnb','flight','airline','travel','booking'], cat: 'Travel' },
-    { keys: ['school','university','course','book','education'], cat: 'Education' },
-    { keys: ['gym','fitness','sport'], cat: 'Health & Fitness' },
-    { keys: ['rent','mortgage','housing','apartment'], cat: 'Housing' },
+    { keys: ['restaurant','cafe','coffee','food','pizza','burger','diner','bistro','kfc','mcdonald','starbucks','bakery','sushi','noodle','warung','rumah makan','resto','angkringan','warteg'], cat: 'Food & Dining' },
+    { keys: ['pharmacy','drug','clinic','hospital','health','medical','medicine','vitamin','dental','apotek','klinik','rumah sakit','puskesmas'], cat: 'Health & Fitness' },
+    { keys: ['grocery','mart','supermarket','hypermarket','carrefour','walmart','indomaret','alfamart','whole foods','superindo','hypermart','pasar swalayan'], cat: 'Food & Dining' },
+    { keys: ['gas','fuel','petrol','shell','bp ','chevron','esso','pertamina','spbu'], cat: 'Transportation' },
+    { keys: ['uber','lyft','grab','gojek','taxi','bus','train','metro','toll','tol','ojek','parkir','parking'], cat: 'Transportation' },
+    { keys: ['amazon','shopee','tokopedia','lazada','ebay','shop','mall','store','toko'], cat: 'Shopping' },
+    { keys: ['netflix','spotify','cinema','movie','theatre','game','entertainment','bioskop'], cat: 'Entertainment' },
+    { keys: ['electric','water','internet','phone','telco','pln','wifi','pulsa','listrik','indihome','pdam'], cat: 'Utilities' },
+    { keys: ['hotel','airbnb','flight','airline','travel','booking','penginapan','tiket'], cat: 'Travel' },
+    { keys: ['school','university','course','book','education','sekolah','kampus','buku'], cat: 'Education' },
+    { keys: ['gym','fitness','sport','olahraga'], cat: 'Health & Fitness' },
+    { keys: ['rent','mortgage','housing','apartment','kontrakan','kos'], cat: 'Housing' },
   ];
   for (const { keys, cat: c } of kwMap) {
     if (keys.some(k => fullText.includes(k))) { cat = c; break; }
@@ -1972,14 +2093,24 @@ function parseAndFillReceipt(text) {
   const expCats = state.categories.expense;
   if (!expCats.includes(cat)) cat = expCats[0] || 'Other';
 
-  // 4. Set type to Expense
+  // 5. Set type to Expense and pre-fill the form
   setTxnType('Expense');
-
-  // 5. Pre-fill form
+  populateCatDropdown('Expense', cat);
   if (amount) document.getElementById('txn-amount').value = amount;
   if (desc) document.getElementById('txn-desc').value = desc;
   document.getElementById('txn-cat').value = cat;
-  document.getElementById('txn-date').value = new Date().toISOString().split('T')[0];
+  document.getElementById('txn-date').value = date;
+
+  // 6. Show a quick summary of what was auto-filled so the user can sanity-check it
+  const summary = document.getElementById('ocr-result-summary');
+  summary.innerHTML =
+    `<div>💰 <b>${amount ? fmt$(amount) : '—'}</b>${amount ? '' : ' <span style="color:var(--red)">(' + t('ocr_amount_not_found') + ')</span>'}</div>` +
+    `<div>📅 <b>${fmtDate(date)}</b>${foundDate ? '' : ' <span style="color:var(--text3)">(' + t('ocr_date_fallback') + ')</span>'}</div>` +
+    `<div>🏷️ <b>${esc(cat)}</b></div>` +
+    (desc ? `<div>📝 ${esc(desc)}</div>` : '');
+  summary.style.display = 'flex';
+
+  if (!amount) toast(t('ocr_amount_not_found'), 'error');
 }
 </script>
 
