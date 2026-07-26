@@ -1924,29 +1924,30 @@ function triggerReceiptScan() {
   document.getElementById('receipt-file-input').click();
 }
 
-// Upscale small photos and boost contrast before OCR — thermal receipt photos
-// are often low-resolution or unevenly lit, and this measurably improves
-// Tesseract's character recognition without altering what the user sees
-// in the thumbnail preview (which always shows the original photo).
+// Upscale small photos before OCR — more pixels per character measurably
+// helps Tesseract on low-resolution thermal receipt photos. Deliberately NOT
+// doing grayscale/contrast/binarization here: Tesseract.js's modern LSTM
+// engine is trained on natural (anti-aliased, grayscale/color) text and can
+// get WORSE on hard-thresholded black/white input — verified empirically
+// while testing this feature (a synthetic clean-text case that OCR'd
+// correctly at native resolution introduced an extra digit after
+// binarization). Upscaling-only is the safe, well-established improvement;
+// this never touches the thumbnail preview, which always shows the original
+// photo.
 function preprocessReceiptImage(file) {
   return new Promise((resolve, reject) => {
     const img = new Image();
     img.onload = () => {
       try {
-        const scale = img.width < 1000 ? Math.min(3, 1600 / img.width) : 1;
+        const scale = img.width < 1200 ? Math.min(3, 1800 / img.width) : 1;
+        if (scale === 1) { resolve(file); return; }
         const canvas = document.createElement('canvas');
         canvas.width = Math.round(img.width * scale);
         canvas.height = Math.round(img.height * scale);
         const ctx = canvas.getContext('2d');
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = 'high';
         ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-        const d = imgData.data;
-        for (let i = 0; i < d.length; i += 4) {
-          const gray = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
-          const contrasted = Math.min(255, Math.max(0, (gray - 128) * 1.4 + 128));
-          d[i] = d[i+1] = d[i+2] = contrasted;
-        }
-        ctx.putImageData(imgData, 0, 0);
         URL.revokeObjectURL(img.src);
         canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('toBlob failed')), 'image/png');
       } catch (e) { reject(e); }
