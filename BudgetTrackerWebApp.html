@@ -1983,7 +1983,21 @@ async function handleReceiptFile(input) {
   try {
     let ocrInput = file;
     try { ocrInput = await preprocessReceiptImage(file); } catch { /* fall back to the original photo */ }
-    const { data: { text } } = await Tesseract.recognize(ocrInput, 'eng+ind', { logger });
+    // Use an explicit worker (rather than the Tesseract.recognize() one-shot
+    // call) so we can set PSM 6 ("assume a single uniform block of text"),
+    // which is well suited to a narrow single-column receipt and measurably
+    // more reliable than the default automatic-layout detection. This build
+    // of Tesseract.js needs load()/loadLanguage()/initialize() called
+    // explicitly before setParameters() will take effect (setParameters
+    // throws "Cannot read properties of null" otherwise, even though
+    // createWorker's own langs argument is supposed to pre-load them).
+    const worker = await Tesseract.createWorker('eng+ind', 1, { logger });
+    await worker.load();
+    await worker.loadLanguage('eng+ind');
+    await worker.initialize('eng+ind');
+    await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SINGLE_BLOCK });
+    const { data: { text } } = await worker.recognize(ocrInput);
+    await worker.terminate();
     document.getElementById('ocr-loading').style.display = 'none';
     document.getElementById('scan-receipt-btn').disabled = false;
     document.getElementById('receipt-preview').textContent = text;
