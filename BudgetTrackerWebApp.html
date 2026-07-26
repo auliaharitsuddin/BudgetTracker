@@ -2004,10 +2004,14 @@ function toggleReceiptPreview() {
   btn.innerHTML = (visible ? '▼ ' : '▲ ') + t(visible ? 'show_extracted_text' : 'hide_extracted_text');
 }
 
+// Common OCR digit misreads on thermal-receipt fonts: capital O / lowercase o
+// for 0, and capital I / lowercase l for 1.
+function fixOcrDigits(s) { return s.replace(/[Oo]/g, '0').replace(/[Il]/g, '1'); }
+
 // Parse a numeric token from a receipt, correctly handling both Western
 // (1,234.56) and Indonesian/European (1.234,56 or 1.234) formatting.
 function parseReceiptNumber(raw) {
-  let s = raw.trim().replace(/[^\d.,]/g, '');
+  let s = fixOcrDigits(raw.trim()).replace(/[^\d.,]/g, '');
   if (!s) return NaN;
   const lastComma = s.lastIndexOf(',');
   const lastDot = s.lastIndexOf('.');
@@ -2084,19 +2088,25 @@ function rankTotalLine(line) {
   return 0;
 }
 
+// Digits can come out of OCR as O/o/I/l, so number tokens are matched with
+// those letters allowed in the character class, then corrected by fixOcrDigits
+// inside parseReceiptNumber — matching plain \d here would silently truncate
+// a misread token (e.g. "90,7OO" would only capture "90,7").
+const OCR_NUM_TOKEN = /[\dOoIl][\dOoIl.,]*[\dOoIl]|[\dOoIl]/g;
+
 function findReceiptTotal(text, lines) {
   let best = null, bestRank = 0;
   for (const line of lines) {
     const rank = rankTotalLine(line);
     if (rank === 0) continue;
-    const nums = [...line.matchAll(/\d[\d.,]*\d|\d/g)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
+    const nums = [...line.matchAll(OCR_NUM_TOKEN)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
     if (!nums.length) continue;
     const val = Math.max(...nums);
     if (rank >= bestRank) { bestRank = rank; best = val; } // ties favor the later (bottom-most) line
   }
   if (best !== null) return best;
   // Fallback: no recognizable total wording at all — use the largest plausible currency number
-  const numMatches = [...text.matchAll(/\d[\d.,]{2,}\d/g)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
+  const numMatches = [...text.matchAll(/[\dOoIl][\dOoIl.,]{2,}[\dOoIl]/g)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
   return numMatches.length ? Math.max(...numMatches) : null;
 }
 
