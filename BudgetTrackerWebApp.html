@@ -1924,7 +1924,39 @@ function triggerReceiptScan() {
   document.getElementById('receipt-file-input').click();
 }
 
-function handleReceiptFile(input) {
+// Upscale small photos and boost contrast before OCR — thermal receipt photos
+// are often low-resolution or unevenly lit, and this measurably improves
+// Tesseract's character recognition without altering what the user sees
+// in the thumbnail preview (which always shows the original photo).
+function preprocessReceiptImage(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = img.width < 1000 ? Math.min(3, 1600 / img.width) : 1;
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(img.width * scale);
+        canvas.height = Math.round(img.height * scale);
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+        const d = imgData.data;
+        for (let i = 0; i < d.length; i += 4) {
+          const gray = 0.299 * d[i] + 0.587 * d[i+1] + 0.114 * d[i+2];
+          const contrasted = Math.min(255, Math.max(0, (gray - 128) * 1.4 + 128));
+          d[i] = d[i+1] = d[i+2] = contrasted;
+        }
+        ctx.putImageData(imgData, 0, 0);
+        URL.revokeObjectURL(img.src);
+        canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('toBlob failed')), 'image/png');
+      } catch (e) { reject(e); }
+    };
+    img.onerror = () => reject(new Error('image load failed'));
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+async function handleReceiptFile(input) {
   const file = input.files[0];
   if (!file) return;
   if (!file.type.startsWith('image/')) { toast('Please select an image file', 'error'); return; }
@@ -1941,26 +1973,27 @@ function handleReceiptFile(input) {
   document.getElementById('ocr-result-summary').style.display = 'none';
   document.getElementById('scan-receipt-btn').disabled = true;
 
-  Tesseract.recognize(file, 'eng+ind', {
-    logger: m => {
-      if (m.status === 'recognizing text' && typeof m.progress === 'number') {
-        document.getElementById('ocr-loading-text').innerHTML = '🔍 <span>' + t('scanning') + ' ' + Math.round(m.progress * 100) + '%</span>';
-      }
+  const logger = m => {
+    if (m.status === 'recognizing text' && typeof m.progress === 'number') {
+      document.getElementById('ocr-loading-text').innerHTML = '🔍 <span>' + t('scanning') + ' ' + Math.round(m.progress * 100) + '%</span>';
     }
-  })
-    .then(({ data: { text } }) => {
-      document.getElementById('ocr-loading').style.display = 'none';
-      document.getElementById('scan-receipt-btn').disabled = false;
-      document.getElementById('receipt-preview').textContent = text;
-      document.getElementById('receipt-collapsible').style.display = 'block';
-      parseAndFillReceipt(text);
-      toast(t('ocr_done'));
-    })
-    .catch(err => {
-      document.getElementById('ocr-loading').style.display = 'none';
-      document.getElementById('scan-receipt-btn').disabled = false;
-      toast('OCR failed: ' + err.message, 'error');
-    });
+  };
+
+  try {
+    let ocrInput = file;
+    try { ocrInput = await preprocessReceiptImage(file); } catch { /* fall back to the original photo */ }
+    const { data: { text } } = await Tesseract.recognize(ocrInput, 'eng+ind', { logger });
+    document.getElementById('ocr-loading').style.display = 'none';
+    document.getElementById('scan-receipt-btn').disabled = false;
+    document.getElementById('receipt-preview').textContent = text;
+    document.getElementById('receipt-collapsible').style.display = 'block';
+    parseAndFillReceipt(text);
+    toast(t('ocr_done'));
+  } catch (err) {
+    document.getElementById('ocr-loading').style.display = 'none';
+    document.getElementById('scan-receipt-btn').disabled = false;
+    toast('OCR failed: ' + err.message, 'error');
+  }
 }
 
 function toggleReceiptPreview() {
@@ -2004,12 +2037,20 @@ function parseReceiptDate(text) {
   const clamp = (y) => (y < 100 ? 2000 + y : y);
   const isPlausible = (y,m,d) => y >= 2000 && y <= now.getFullYear() + 1 && m >= 1 && m <= 12 && d >= 1 && d <= 31;
 
-  // "23 Jul 2026" / "23 Juli 2026"
+  // "23 Jul 2026" / "23 Juli 2026" (day-first)
   let m = text.match(/\b(\d{1,2})\s+([A-Za-z]{3,9})\s+(\d{2,4})\b/);
   if (m) {
     const mon = monthNames[m[2].slice(0,3).toLowerCase()];
     const y = clamp(parseInt(m[3]));
     const d = parseInt(m[1]);
+    if (mon && isPlausible(y, mon, d)) return `${y}-${String(mon).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
+  }
+  // "Feb 20, 2022" (month-first, common on POS/US-style receipts)
+  m = text.match(/\b([A-Za-z]{3,9})\s+(\d{1,2}),?\s+(\d{2,4})\b/);
+  if (m) {
+    const mon = monthNames[m[1].slice(0,3).toLowerCase()];
+    const d = parseInt(m[2]);
+    const y = clamp(parseInt(m[3]));
     if (mon && isPlausible(y, mon, d)) return `${y}-${String(mon).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
   }
   // YYYY-MM-DD or YYYY/MM/DD
@@ -2018,7 +2059,7 @@ function parseReceiptDate(text) {
     const y = parseInt(m[1]), mo = parseInt(m[2]), d = parseInt(m[3]);
     if (isPlausible(y, mo, d)) return `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}`;
   }
-  // DD/MM/YYYY or DD-MM-YYYY (day-first, common in Indonesia)
+  // DD/MM/YYYY, DD-MM-YYYY, or DD.MM.YY (day-first, common in Indonesia)
   m = text.match(/\b(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})\b/);
   if (m) {
     const a = parseInt(m[1]), b = parseInt(m[2]), y = clamp(parseInt(m[3]));
@@ -2029,53 +2070,90 @@ function parseReceiptDate(text) {
   return null;
 }
 
+// Rank how likely a line is to hold the receipt's real grand total, then
+// return the value on the highest-ranked line (last one, if tied). Payment
+// lines like "Tunai"/"Cash"/"Kembali" are deliberately NOT treated as total
+// sources — they're what the customer paid/got back, not the bill amount.
+function rankTotalLine(line) {
+  const l = line.toLowerCase();
+  if (/\bgrand\s*total\b/.test(l)) return 100;
+  if (/\bsub[\s-]?total\b/.test(l)) return 20;
+  if (/\btotal\b/.test(l)) return 90;          // Total, Total Belanja, Total Bayar, Total Harga...
+  if (/\bjumlah\b/.test(l)) return 80;
+  if (/\bamount\s*due\b|\bbalance\s*due\b/.test(l)) return 85;
+  return 0;
+}
+
+function findReceiptTotal(text, lines) {
+  let best = null, bestRank = 0;
+  for (const line of lines) {
+    const rank = rankTotalLine(line);
+    if (rank === 0) continue;
+    const nums = [...line.matchAll(/\d[\d.,]*\d|\d/g)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
+    if (!nums.length) continue;
+    const val = Math.max(...nums);
+    if (rank >= bestRank) { bestRank = rank; best = val; } // ties favor the later (bottom-most) line
+  }
+  if (best !== null) return best;
+  // Fallback: no recognizable total wording at all — use the largest plausible currency number
+  const numMatches = [...text.matchAll(/\d[\d.,]{2,}\d/g)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
+  return numMatches.length ? Math.max(...numMatches) : null;
+}
+
+// A line that looks like a street/region address rather than a merchant name
+// or a receipt metadata field (used both to find the address and to exclude
+// address lines when guessing the merchant name).
+const ADDRESS_LINE_RE = /\b(jl\.?|jalan|ruko|rt\.?\s*[:\d]|rw\.?\s*[:\d]|kec\.?|kab\.?|kelurahan|kel\.?|blok|komplek(?:s)?|perumahan)\b/i;
+const RECEIPT_META_RE = /^(shift|no\.?\s*trans|waktu|check\s*no|pos\d|print\s*cnt|cashier|server|tbl|pax|struk|npwp)\b/i;
+
+function parseReceiptAddress(lines) {
+  for (let i = 0; i < lines.length; i++) {
+    if (!ADDRESS_LINE_RE.test(lines[i])) continue;
+    const parts = [lines[i]];
+    for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
+      if (RECEIPT_META_RE.test(lines[j]) || /^[\d\s.,\-*#=()]+$/.test(lines[j])) break;
+      parts.push(lines[j]);
+    }
+    return parts.join(', ').replace(/,\s*,/g, ',').substring(0, 140);
+  }
+  return '';
+}
+
 function parseAndFillReceipt(text) {
   const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
   const fullText = text.toLowerCase();
 
-  // 1. Find amount – look for Total / Grand Total / Bayar / Jumlah patterns (EN + ID),
-  //    preferring the largest matching "total"-style line since receipts often list
-  //    subtotal, tax, and grand total separately.
-  let amount = null;
-  const totalLinePattern = /(?:grand\s*total|total\s*(?:amount|belanja|bayar|tagihan)?|jumlah\s*(?:bayar|total)?|amount\s*due|balance\s*due|bayar|tunai|cash)[^\d]{0,10}(rp\.?\s*)?([\d][\d.,]*\d|\d)/i;
-  const candidates = [];
-  for (const line of lines) {
-    const m = line.match(totalLinePattern);
-    if (m) {
-      const val = parseReceiptNumber(m[2]);
-      if (!isNaN(val) && val > 0) candidates.push(val);
-    }
-  }
-  if (candidates.length) {
-    amount = Math.max(...candidates);
-  } else {
-    // Fallback: largest plausible currency-like number anywhere in the receipt
-    const numMatches = [...text.matchAll(/\d[\d.,]{2,}\d/g)].map(m => parseReceiptNumber(m[0])).filter(v => !isNaN(v) && v > 0);
-    if (numMatches.length) amount = Math.max(...numMatches);
-  }
+  // 1. Find the grand total via priority-ranked keyword matching (see findReceiptTotal)
+  const amount = findReceiptTotal(text, lines);
 
-  // 2. Infer merchant/description from the first meaningful, mostly-alphabetic line
+  // 2. Infer merchant name from the first meaningful, mostly-alphabetic line
+  //    that isn't an address, receipt metadata, or boilerplate.
   let desc = '';
   for (const line of lines) {
     if (line.length > 2 && /[a-zA-Z]{3,}/.test(line) &&
         !/^[\d\s.,\-*#=]+$/.test(line) &&
-        !/receipt|invoice|bill|thank you|struk|terima kasih|npwp|no\.?\s*telp/i.test(line)) {
+        !ADDRESS_LINE_RE.test(line) &&
+        !RECEIPT_META_RE.test(line) &&
+        !/receipt|invoice|bill|thank you|terima kasih|no\.?\s*telp/i.test(line)) {
       desc = line.substring(0, 60);
       break;
     }
   }
 
-  // 3. Extract transaction date from the receipt text (fallback: today)
+  // 3. Extract the merchant's street address, if present
+  const address = parseReceiptAddress(lines);
+
+  // 4. Extract transaction date from the receipt text (fallback: today)
   const foundDate = parseReceiptDate(text);
   const date = foundDate || new Date().toISOString().split('T')[0];
 
-  // 4. Auto-detect category based on keywords (English + Indonesian)
+  // 5. Auto-detect category based on keywords (English + Indonesian brands/terms)
   let cat = 'Other';
   const kwMap = [
-    { keys: ['restaurant','cafe','coffee','food','pizza','burger','diner','bistro','kfc','mcdonald','starbucks','bakery','sushi','noodle','warung','rumah makan','resto','angkringan','warteg'], cat: 'Food & Dining' },
+    { keys: ['restaurant','cafe','coffee','food','pizza','burger','diner','bistro','kfc','mcdonald','starbucks','bakery','sushi','noodle','warung','rumah makan','resto','angkringan','warteg','seafood','breadtalk','pudding','croissant'], cat: 'Food & Dining' },
     { keys: ['pharmacy','drug','clinic','hospital','health','medical','medicine','vitamin','dental','apotek','klinik','rumah sakit','puskesmas'], cat: 'Health & Fitness' },
     { keys: ['grocery','mart','supermarket','hypermarket','carrefour','walmart','indomaret','alfamart','whole foods','superindo','hypermart','pasar swalayan'], cat: 'Food & Dining' },
-    { keys: ['gas','fuel','petrol','shell','bp ','chevron','esso','pertamina','spbu'], cat: 'Transportation' },
+    { keys: ['gas','fuel','petrol','shell','bp ','chevron','esso','pertamina','spbu','pertamax','pertalite'], cat: 'Transportation' },
     { keys: ['uber','lyft','grab','gojek','taxi','bus','train','metro','toll','tol','ojek','parkir','parking'], cat: 'Transportation' },
     { keys: ['amazon','shopee','tokopedia','lazada','ebay','shop','mall','store','toko'], cat: 'Shopping' },
     { keys: ['netflix','spotify','cinema','movie','theatre','game','entertainment','bioskop'], cat: 'Entertainment' },
@@ -2084,6 +2162,9 @@ function parseAndFillReceipt(text) {
     { keys: ['school','university','course','book','education','sekolah','kampus','buku'], cat: 'Education' },
     { keys: ['gym','fitness','sport','olahraga'], cat: 'Health & Fitness' },
     { keys: ['rent','mortgage','housing','apartment','kontrakan','kos'], cat: 'Housing' },
+    // Weak fallback signals when the merchant's brand name is only shown as a
+    // logo (unreadable by OCR) and no stronger keyword matched above.
+    { keys: ['belanja','minimarket'], cat: 'Shopping' },
   ];
   for (const { keys, cat: c } of kwMap) {
     if (keys.some(k => fullText.includes(k))) { cat = c; break; }
@@ -2093,21 +2174,23 @@ function parseAndFillReceipt(text) {
   const expCats = state.categories.expense;
   if (!expCats.includes(cat)) cat = expCats[0] || 'Other';
 
-  // 5. Set type to Expense and pre-fill the form
+  // 6. Set type to Expense and pre-fill the form
   setTxnType('Expense');
   populateCatDropdown('Expense', cat);
   if (amount) document.getElementById('txn-amount').value = amount;
   if (desc) document.getElementById('txn-desc').value = desc;
   document.getElementById('txn-cat').value = cat;
   document.getElementById('txn-date').value = date;
+  if (address) document.getElementById('txn-notes').value = address;
 
-  // 6. Show a quick summary of what was auto-filled so the user can sanity-check it
+  // 7. Show a quick summary of what was auto-filled so the user can sanity-check it
   const summary = document.getElementById('ocr-result-summary');
   summary.innerHTML =
     `<div>💰 <b>${amount ? fmt$(amount) : '—'}</b>${amount ? '' : ' <span style="color:var(--red)">(' + t('ocr_amount_not_found') + ')</span>'}</div>` +
     `<div>📅 <b>${fmtDate(date)}</b>${foundDate ? '' : ' <span style="color:var(--text3)">(' + t('ocr_date_fallback') + ')</span>'}</div>` +
     `<div>🏷️ <b>${esc(cat)}</b></div>` +
-    (desc ? `<div>📝 ${esc(desc)}</div>` : '');
+    (desc ? `<div>📝 ${esc(desc)}</div>` : '') +
+    (address ? `<div>📍 ${esc(address)}</div>` : '');
   summary.style.display = 'flex';
 
   if (!amount) toast(t('ocr_amount_not_found'), 'error');
